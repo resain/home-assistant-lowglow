@@ -1,0 +1,361 @@
+#
+# Read your electricity meter in a battery frendly way by means of the pulse LED on your 
+# meter. Uses the ESP32 deep sleep capabilities to extend battery life.
+#
+# Inspired by Home Assistant Glow
+#
+# TODOS
+# 1.  Monitor USB VCC via GPIO and voltage divider - DONE
+# 2.  If external VCC present then inhibit deep sleep and keep external VCC on (using CC control) until local battery fully charged - DONE
+# 3.  Pulse timeout when not sleeping - TO BE TESTED
+# 4.  Alarm if external battery is dead - DONE
+# 5.  Update HA as close to midnight as possible for allignment with Smart Meter readings - DONE
+# 6.  Inc count on wake-up and cause EXT0 then for subsequent pulses use binary sensor (this will hopfully avoid lost pulses under high demand) - DONE
+# 7.  Use millis() to get more accurate boot-up times from sleep (and reset from sleep mode switch) - DONE
+# 8.  Use RTC to calculate the rough interval between pulses and if too short inhibit sleep - DONE
+# 9.  Disable status LED to save power - DONE
+
+substitutions:
+  device_name: esphome-web-5799a0
+  secret_api_key: !secret esphome-web-5799a0_api_key
+  secret_ap_password: !secret esphome-web-5799a0_ap_password
+  friendly_name: ESPHome-Electricity-Meter
+  device_description: "Measure energy consumption with the pulse LED on your meter"
+  board_type: firebeetle32
+  pulse_pin: GPIO25
+  sleep_mode_pin: GPIO26
+  USB_VCC_pin: GPIO27
+  battery_voltage_pin: GPIO36
+  USB_CC_control_pin: GPIO13
+  status_led: GPIO2
+
+
+
+esphome:
+  name: '${device_name}'
+  on_boot:
+    priority: 600
+    # ...
+    then:
+      - lambda: |-
+          id(t) = millis();
+          if (id(t) > id(t_boot_max)) id(t_boot_max) = id(t);
+          if (id(t) < id(t_boot_min)) id(t_boot_min) = id(t);
+
+      - lambda: |-
+          id(wake_up_reason) = esp_sleep_get_wakeup_cause(); 
+
+      - if:
+          condition:
+          # wakeup is a timeout
+            lambda: |-
+              return id(wake_up_reason) == ESP_SLEEP_WAKEUP_TIMER; 
+          then:
+            - logger.log:
+                format: "Wakeup On The Hour %ulms" 
+                args: [ 'id(t)']
+            - binary_sensor.template.publish:
+                id: pause_sleep
+                state: True
+      - if:
+          condition:
+          # wakeup is a pulse so increment count
+            lambda: |-
+              return id(wake_up_reason) == ESP_SLEEP_WAKEUP_EXT0; 
+          then:
+            - logger.log:
+                format: "Wakeup on Meter Pulse %ulms"
+                args: [ 'id(t)']
+            - lambda: |-
+                id(total_energy_count) +=1;
+
+            - sensor.template.publish:
+                id: total_energy_sensor
+                state: !lambda 'return id(total_energy_count);'
+    
+esp32:
+  board: '${board_type}'
+
+globals:
+  - id: total_energy_count
+    type: int
+    restore_value: True
+    initial_value: '0'
+
+  - id: sleep_duration_to_next_hour
+    type: int
+    restore_value: False
+    initial_value: '0'
+
+  - id: wake_up_reason 
+    type: int 
+    restore_value: False
+    initial_value: '0' 
+
+  - id: t #place holder for millis count since restart
+    type: unsigned long
+    restore_value: False
+    initial_value: '0'
+
+  - id: t_boot_max
+    type: unsigned long
+    restore_value: True
+    initial_value: '0'
+
+  - id: t_boot_min
+    type: unsigned long
+    restore_value: True
+    initial_value: '0'
+
+  - id: last_pulse #last pulse seconds count timestamp
+    type: long
+    restore_value: True
+    initial_value: '0'   
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: $secret_api_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: True
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: ${device_name}
+    password: $secret_ap_password
+
+captive_portal:
+
+# Enable Web Server
+#web_server:
+#  port: 80
+
+switch:
+  - platform: safe_mode
+    name: "ESP32 (Safe Mode)"
+    id: set_safe_mode
+
+  - id: USB_CC_control
+    name: "USB CC Control"
+    platform: gpio
+    pin:
+      number: '${USB_CC_control_pin}'
+    on_turn_on:
+      - delay: 5s
+      - if:
+          condition:
+            binary_sensor.is_off: USB_VCC
+          then:
+            - switch.turn_off: USB_CC_control
+            - binary_sensor.template.publish:
+                id: external_battery_error
+                state: True
+
+sensor:
+
+  - platform: template
+    name: "Total Energy"
+    id: total_energy_sensor
+    unit_of_measurement: 'Wh'
+    icon: mdi:circle-slice-3
+    state_class: total_increasing
+    device_class: energy
+    accuracy_decimals: 0
+    filters: 
+      - timeout: 600s
+    on_value:
+      then:
+        - lambda: |-
+            auto tm = id(ha_time).now();
+            int interval;
+            id(sleep_duration_to_next_hour) = (3600-(tm.minute*60)-tm.second-40)*1000; /* wake-up 40sec before the hour to update HA */
+            interval = tm.timestamp-id(last_pulse);
+            if (interval < 0) interval = int(id(pulse_interval)); /* invalid due to time synch adjustment etc so use last value */
+            else if (interval > 10) interval = 10; /* clamp if too big */
+            id(pulse_interval).publish_state(interval);
+            id(last_pulse) = tm.timestamp; 
+        - if:
+            condition:
+              and:
+                - binary_sensor.is_on: sleep_mode_switch
+                - binary_sensor.is_off: pause_sleep
+                - binary_sensor.is_off: USB_VCC
+                - time.has_time:
+                - lambda: 'return id(sleep_duration_to_next_hour) > 0;'
+                - sensor.in_range:
+                    id: pulse_interval
+                    above: 2.0
+            then:
+              # go back to sleep until next pulse or timeout on duration
+              - lambda: 'id(t) = millis();'
+              - logger.log:
+                  format: "Runtime to sleep %dms"
+                  args: [ 'id(t)']
+              - logger.log:
+                  format: "Wakeup Reason was %d"
+                  args: [ 'id(wake_up_reason)']
+              - deep_sleep.enter:
+                  id: deep_sleep_1
+                  sleep_duration: !lambda 'return id(sleep_duration_to_next_hour);'
+
+  - platform: template
+    name: "Pulse Interval"
+    id: pulse_interval
+    unit_of_measurement: 's'
+    filters: 
+      - clamp: 
+          max_value: 10
+          min_value: 0
+          ignore_out_of_range: true
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1                      
+
+  - platform: adc
+    name: "Battery voltage"
+    pin: '${battery_voltage_pin}'
+    accuracy_decimals: 2
+    update_interval: 5s
+    attenuation: 12dB
+    filters:
+      - multiply: 2.0  # The voltage divider requires us to multiply by 2   
+    on_value_range:
+      - below: 3.4
+        then:
+          - switch.turn_on: USB_CC_control
+      - above: 4.1
+        then:
+          - switch.turn_off: USB_CC_control
+          - binary_sensor.template.publish:
+              id: pause_sleep
+              state: False
+
+binary_sensor:
+  - platform: gpio
+    #name: "Energy Meter Pulse"
+    pin: 
+      number: '${pulse_pin}'
+      allow_other_uses: true
+    id: energy_meter_input
+    filters:
+      - invert:
+      - delayed_on: 1ms
+      - delayed_off: 20ms
+    publish_initial_state: True
+    on_state:
+      if:
+        condition:
+           binary_sensor.is_on: energy_meter_input
+        then:
+          - lambda: |-
+              id(total_energy_count) +=1;
+
+          - sensor.template.publish:
+              id: total_energy_sensor
+              state: !lambda 'return id(total_energy_count);'
+
+
+                         
+  - platform: gpio
+    name: "Sleep Switch"
+    pin: 
+      number: '${sleep_mode_pin}'
+      mode: INPUT_PULLDOWN
+    id: sleep_mode_switch
+    # Reset max/win wake up timers when sleep mode switch state is changed
+    on_state:
+      then:
+        - lambda: 'id(t_boot_max) = 0;'
+        - lambda: 'id(t_boot_min) = 9999;'
+        - binary_sensor.template.publish:
+            id: pause_sleep
+            state: False
+
+  - platform: gpio
+    name: "USB VCC"
+    pin:
+      number: '${USB_VCC_pin}'
+      mode: 
+        input: True
+    id: USB_VCC
+    # latch USB VCC on by using USB_CC control output
+    on_press: 
+      then:
+        - switch.turn_on: USB_CC_control
+        - binary_sensor.template.publish:
+            id: external_battery_error
+            state: False
+    on_release: 
+      then:
+        - if:
+            condition:
+              switch.is_on: USB_CC_control
+            then:
+              - binary_sensor.template.publish:
+                  id: external_battery_error
+                  state: True
+
+
+# Status Binary Sensor exposes the node state (if it’s connected to via native API)
+  - platform: status
+    id: node_status
+    on_state:
+      then:
+        - if:
+            condition:
+              binary_sensor.is_on: node_status
+            then:
+              - delay: 1s
+              - binary_sensor.template.publish:
+                  id: pause_sleep
+                  state: False
+
+        - lambda: 'id(t) = millis();'
+        - logger.log:
+            format: "Runtime to state %d, %dms"
+            args: [ 'x','id(t)']
+        - logger.log:
+              format: "Boot Max/Min %dms/ %dms"
+              args: [ 'id(t_boot_max)','id(t_boot_min)']
+
+  - platform: template
+    name: "External Battery Error"
+    id: external_battery_error
+
+  # pause sleep to update HA - after a period reset (typically resets on HA connected)
+  - platform: template
+    name: "Sleep Paused"
+    id: pause_sleep
+    publish_initial_state: False
+    on_press: 
+      then:
+        - delay: 60s
+        - binary_sensor.template.publish:
+            id: pause_sleep
+            state: False
+
+
+deep_sleep:
+  id: deep_sleep_1
+  wakeup_pin:
+    number: '${pulse_pin}'
+    inverted: true
+    allow_other_uses: true 
+  wakeup_pin_mode: KEEP_AWAKE
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      then:
+        - logger.log: "Synchronized system clock"
+    
